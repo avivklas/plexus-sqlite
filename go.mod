@@ -2,10 +2,15 @@ module github.com/avivklas/plexus-sqlite
 
 go 1.26.3
 
-replace github.com/avivklas/plexus => /Users/avivk/dev/github.com/avivklas/plexus
+require (
+	github.com/avivklas/plexus v0.1.0
+	github.com/hashicorp/raft v1.8.0
+	github.com/jackc/pgproto3/v2 v2.3.3
+	github.com/jackc/pgx/v5 v5.11.0
+	modernc.org/sqlite v1.59.0
+)
 
 require (
-	github.com/avivklas/plexus v0.0.0-00010101000000-000000000000 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -14,13 +19,10 @@ require (
 	github.com/hashicorp/go-metrics v0.7.0 // indirect
 	github.com/hashicorp/go-msgpack/v2 v2.1.5 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/hashicorp/raft v1.8.0 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.0 // indirect
 	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
-	github.com/jackc/pgproto3/v2 v2.3.3 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgx/v5 v5.11.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
@@ -30,5 +32,4 @@ require (
 	modernc.org/libc v1.75.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.59.0 // indirect
 )
