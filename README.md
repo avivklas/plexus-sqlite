@@ -24,7 +24,7 @@ It exposes a **PostgreSQL wire protocol (pgwire)** interface, enabling standard 
 |                                                                                    |
 |  +-------------------------------------------------------------------------------+ |
 |  |                     PostgreSQL Wire Protocol Engine (pgwire)                  | |
-|  |   - Handshake (SSL negotiation, Startup, AuthOK)                             | |
+|  |   - Handshake (SSL negotiation, Startup, AuthOK)                              | |
 |  |   - Simple Query ('Q') & Extended Query ('P', 'B', 'E', 'S')                  | |
 |  |   - SQL Classifier (Read vs. Write / DDL / Tx)                                | |
 |  |   - Placeholder Rewriting ($1, $2 -> ?)                                       | |
