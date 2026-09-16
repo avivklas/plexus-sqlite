@@ -12,18 +12,22 @@ import (
 )
 
 func TestSQLStoreWithPlexusCluster(t *testing.T) {
+	// Test in-memory SQLite store with Raft consensus
+	store, err := NewInMemory()
+	if err != nil {
+		t.Fatalf("NewInMemory sqlstore failed: %v", err)
+	}
+	defer store.Close()
+
+	if !store.IsInMemory() {
+		t.Fatalf("expected store to be in-memory")
+	}
+
 	tmpDir, err := os.MkdirTemp("", "plexus-sqlite-test-*")
 	if err != nil {
 		t.Fatalf("create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
-
-	dbPath := filepath.Join(tmpDir, "test.db")
-	store, err := New(dbPath)
-	if err != nil {
-		t.Fatalf("New sqlstore failed: %v", err)
-	}
-	defer store.Close()
 
 	// Setup single-process Plexus cluster
 	clusterCfg := plexus.DefaultClusterConfig("sql-node-1", "127.0.0.1:9292", filepath.Join(tmpDir, "cluster"))
@@ -88,9 +92,9 @@ func TestSQLStoreWithPlexusCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
-	defer rows.Close()
 
 	if !rows.Next() {
+		rows.Close()
 		t.Fatalf("expected 1 row returned")
 	}
 
@@ -98,8 +102,11 @@ func TestSQLStoreWithPlexusCluster(t *testing.T) {
 	var name string
 	var price float64
 	if err := rows.Scan(&id, &name, &price); err != nil {
+		rows.Close()
 		t.Fatalf("Scan failed: %v", err)
 	}
+	rows.Close()
+
 	if id != 1 || name != "Widget" || price != 19.99 {
 		t.Errorf("unexpected row data: id=%d name=%s price=%f", id, name, price)
 	}
@@ -118,7 +125,7 @@ func TestSQLStoreWithPlexusCluster(t *testing.T) {
 		t.Errorf("expected 3 total rows affected, got %d", batchRes.TotalRowsAffected)
 	}
 
-	// 5. Snapshot & Restore verification
+	// 5. Snapshot & Restore into another In-Memory SQLite store
 	snap, err := store.Snapshot()
 	if err != nil {
 		t.Fatalf("Snapshot failed: %v", err)
@@ -127,10 +134,9 @@ func TestSQLStoreWithPlexusCluster(t *testing.T) {
 		t.Fatalf("expected non-empty snapshot")
 	}
 
-	restorePath := filepath.Join(tmpDir, "restore.db")
-	restoredStore, err := New(restorePath)
+	restoredStore, err := NewInMemory()
 	if err != nil {
-		t.Fatalf("New restored store failed: %v", err)
+		t.Fatalf("NewInMemory restored store failed: %v", err)
 	}
 	defer restoredStore.Close()
 
@@ -142,5 +148,55 @@ func TestSQLStoreWithPlexusCluster(t *testing.T) {
 	err = restoredStore.QueryRow(ctx, "SELECT COUNT(*) FROM items;").Scan(&count)
 	if err != nil || count != 3 {
 		t.Fatalf("expected 3 items in restored db, got count=%d err=%v", count, err)
+	}
+}
+
+func TestSQLStoreOnDisk(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "plexus-sqlite-disk-test-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "disk.db")
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New disk sqlstore failed: %v", err)
+	}
+	defer store.Close()
+
+	if store.IsInMemory() {
+		t.Fatalf("expected store to be on-disk")
+	}
+
+	ctx := context.Background()
+	_, err = store.db.Exec(ctx, "CREATE TABLE notes (id INT, txt TEXT);")
+	if err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	_, err = store.db.Exec(ctx, "INSERT INTO notes VALUES (1, 'disk');")
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	snap, err := store.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+
+	restorePath := filepath.Join(tmpDir, "restored_disk.db")
+	restored, err := New(restorePath)
+	if err != nil {
+		t.Fatalf("New restore failed: %v", err)
+	}
+	defer restored.Close()
+
+	if err := restored.Restore(snap); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	var count int
+	if err := restored.QueryRow(ctx, "SELECT COUNT(*) FROM notes;").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("expected 1 note, got count=%d err=%v", count, err)
 	}
 }

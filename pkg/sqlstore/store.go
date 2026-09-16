@@ -19,6 +19,7 @@ type Store struct {
 }
 
 // New creates a new Store backed by the SQLite database at the specified path.
+// If dbPath is empty or ":memory:", an in-memory database with shared cache is used.
 func New(dbPath string) (*Store, error) {
 	sqliteDB, err := OpenDB(dbPath)
 	if err != nil {
@@ -35,6 +36,16 @@ func New(dbPath string) (*Store, error) {
 	plexus.Handle(s.Router(), CmdBatch, s.handleBatch)
 
 	return s, nil
+}
+
+// NewInMemory creates a new Store backed by an in-memory SQLite database.
+func NewInMemory() (*Store, error) {
+	return New(":memory:")
+}
+
+// IsInMemory reports whether the store's SQLite database is running in memory.
+func (s *Store) IsInMemory() bool {
+	return s.db.IsInMemory()
 }
 
 // ID implements plexus.Store.

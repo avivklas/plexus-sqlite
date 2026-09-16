@@ -21,11 +21,10 @@ func TestPGWireWithPostgresClient(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// 1. Setup sqlstore
-	dbPath := filepath.Join(tmpDir, "pgtest.db")
-	store, err := sqlstore.New(dbPath)
+	// 1. Setup in-memory sqlstore
+	store, err := sqlstore.NewInMemory()
 	if err != nil {
-		t.Fatalf("New sqlstore failed: %v", err)
+		t.Fatalf("NewInMemory sqlstore failed: %v", err)
 	}
 	defer store.Close()
 

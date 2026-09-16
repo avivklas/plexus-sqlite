@@ -1,4 +1,4 @@
-dsqlite
+/dsqlite
 *.db
 *.db-wal
 *.db-shm

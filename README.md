@@ -9,7 +9,7 @@ It exposes a **PostgreSQL wire protocol (pgwire)** interface, enabling standard 
 
 ---
 
-## Architecture
+### Architecture
 
 ```
                                +-----------------------------+
@@ -37,19 +37,28 @@ It exposes a **PostgreSQL wire protocol (pgwire)** interface, enabling standard 
 |                       +---------------+---------------+                            |
 |                                       |                                            |
 |             +-------------------------+-------------------------+                  |
-|             | (Local Read)                                      | (Mutator.Apply)  |
+|             | (Local In-Memory Read)                            | (Mutator.Apply)  |
 |             v                                                   v                  |
 |     +---------------+                                   +---------------+          |
-|     | Local SQLite3 | <================================ | Plexus Cluster|          |
-|     |  Engine (WAL) |   (FSM Apply after Quorum Commit) | & Raft Engine |          |
+|     | In-Memory DB  | <================================ | Plexus Cluster|          |
+|     | (Shared Cache)|   (FSM Apply after Quorum Commit) | & Raft Engine |          |
 |     +---------------+                                   +---------------+          |
+|                                                                 |                  |
+|                                                                 v                  |
+|                                                         +---------------+          |
+|                                                         | Raft LogStore |          |
+|                                                         |  (Direct-I/O) |          |
+|                                                         +---------------+          |
 +------------------------------------------------------------------------------------+
 ```
 
-### Consistency Model
-- **Mutations & DDL (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`)**: Replicated across the Raft cluster using Plexus. Thanks to Plexus's **Quorum + Local Apply guarantee**, a write is only acknowledged (`CommandComplete`) after being committed by quorum **and** applied to the local SQLite database.
-- **Reads (`SELECT`, `PRAGMA`, `EXPLAIN`)**: Executed directly on the local SQLite engine with zero network overhead ($O(1)$ latency). Because writes guarantee local application before returning, subsequent local reads are guaranteed to have **Read-Your-Own-Writes / Monotonic Read consistency**.
-- **Snapshots & Restore**: State synchronization and log compaction use SQLite's native `VACUUM INTO` and WAL checkpoints.
+### Key Design Principles
+- **In-Memory SQLite Engine (`in mem`)**: By default, SQLite is opened in memory using URI shared cache (`file:plexus_mem?mode=memory&cache=shared`). Reads and queries run entirely in memory with microsecond latencies.
+- **Raft Log Durability**: State durability is guaranteed by the underlying Plexus Raft cluster and its Direct-I/O SegmentLogStore. Upon node bootstrap or rejoin, the in-memory SQLite instance is hydrated automatically from the Raft snapshot and log replay.
+- **Consistency Model**:
+  - **Mutations & DDL (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`)**: Replicated across the Raft cluster using Plexus. Writes are only acknowledged (`CommandComplete`) after being committed by quorum **and** applied to the local in-memory SQLite database.
+  - **Reads (`SELECT`, `PRAGMA`, `EXPLAIN`)**: Executed directly against the local in-memory SQLite engine with zero network overhead ($O(1)$ latency) and guaranteed **Read-Your-Own-Writes / Monotonic Read consistency**.
+  - **Snapshots & Restore**: Cluster snapshot synchronization uses SQLite's native `VACUUM INTO` and online backup engine (`sqlite3_backup`).
 
 ---
 
