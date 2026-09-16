@@ -1,0 +1,7 @@
+dsqlite
+*.db
+*.db-wal
+*.db-shm
+*.seg
+data/
+*.tmp
