@@ -32,8 +32,9 @@ func New(dbPath string) (*Store, error) {
 	}
 
 	// Register Raft mutating handlers
-	plexus.Handle(s.Router(), CmdExec, s.handleExec)
-	plexus.Handle(s.Router(), CmdBatch, s.handleBatch)
+	s.Handle(CmdExec, s.handleExec)
+	s.Handle(CmdBatch, s.handleBatch)
+
 
 	return s, nil
 }

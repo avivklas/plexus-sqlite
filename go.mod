@@ -1,6 +1,8 @@
 module github.com/avivklas/plexus-sqlite
 
-go 1.26.3
+go 1.27.0
+
+replace github.com/avivklas/plexus => ../plexus
 
 require (
 	github.com/avivklas/plexus v0.1.0
@@ -9,6 +11,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	modernc.org/sqlite v1.59.0
 )
+
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
