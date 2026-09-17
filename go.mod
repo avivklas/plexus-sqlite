@@ -5,7 +5,7 @@ go 1.27.0
 replace github.com/avivklas/plexus => ../plexus
 
 require (
-	github.com/avivklas/plexus v0.1.0
+	github.com/avivklas/plexus v0.2.0
 	github.com/hashicorp/raft v1.8.0
 	github.com/jackc/pgproto3/v2 v2.3.3
 	github.com/jackc/pgx/v5 v5.11.0

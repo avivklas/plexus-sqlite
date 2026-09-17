@@ -1,6 +1,6 @@
 # Plexus-SQLite: Distributed SQLite with PostgreSQL Wire Protocol
 
-[![Go Version](https://img.shields.io/badge/go-1.22%2B-blue)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.27%2B-blue)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **Plexus-SQLite** turns SQLite into a distributed, fault-tolerant relational database server powered by the [Plexus](https://github.com/avivklas/plexus) consensus framework.
