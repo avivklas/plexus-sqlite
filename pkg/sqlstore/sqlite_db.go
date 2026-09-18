@@ -96,6 +96,17 @@ func (d *DB) IsInMemory() bool {
 	return d.inMemory
 }
 
+// AcquireConn returns a dedicated *sql.Conn from the pool.
+// The caller must call conn.Close() when done to return it.
+// Used by sessions that want a persistent read connection to avoid
+// per-query pool checkout overhead under high concurrency.
+func (d *DB) AcquireConn(ctx context.Context) (*sql.Conn, error) {
+	d.mu.RLock()
+	db := d.db
+	d.mu.RUnlock()
+	return db.Conn(ctx)
+}
+
 func (d *DB) getOrPrepare(ctx context.Context, query string) (*sql.Stmt, error) {
 	d.stmtMu.RLock()
 	stmt, ok := d.stmts[query]

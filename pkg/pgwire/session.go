@@ -3,25 +3,32 @@ package pgwire
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/avivklas/plexus-sqlite/pkg/sqlstore"
 	"github.com/jackc/pgproto3/v2"
 )
 
+
 const defaultBufferSize = 65536 // 64KB buffer for coalescing pgwire packets
 
 type preparedStmt struct {
-	Query string
+	Query          string
+	ConvertedQuery string
+	QueryType      QueryType
 }
 
 type boundPortal struct {
-	Query string
-	Args  []any
+	Query          string
+	ConvertedQuery string
+	QueryType      QueryType
+	Args           []any
 }
 
 // Session handles an individual PostgreSQL client connection.
@@ -30,6 +37,8 @@ type Session struct {
 	bufWriter  *bufio.Writer
 	backend    *pgproto3.Backend
 	store      *sqlstore.Store
+	readConn   *sql.Conn            // dedicated SQLite connection for this session's reads
+	readStmts  map[string]*sql.Stmt // per-connection prepared statement cache
 	statements map[string]preparedStmt
 	portals    map[string]boundPortal
 	txStatus   byte // 'I' = Idle, 'T' = In transaction
@@ -38,16 +47,22 @@ type Session struct {
 // NewSession initializes a client session over a net.Conn.
 func NewSession(conn net.Conn, store *sqlstore.Store) *Session {
 	bufWriter := bufio.NewWriterSize(conn, defaultBufferSize)
+	// Acquire a dedicated read connection for this session to avoid per-query pool checkout overhead.
+	// Falls back gracefully to the pool if unavailable (readConn stays nil).
+	readConn, _ := store.AcquireReadConn(context.Background())
 	return &Session{
 		conn:       conn,
 		bufWriter:  bufWriter,
 		backend:    pgproto3.NewBackend(pgproto3.NewChunkReader(conn), bufWriter),
 		store:      store,
+		readConn:   readConn,
+		readStmts:  make(map[string]*sql.Stmt),
 		statements: make(map[string]preparedStmt),
 		portals:    make(map[string]boundPortal),
 		txStatus:   'I',
 	}
 }
+
 
 // Serve runs the handshake and main command loop until client terminates or disconnects.
 func (s *Session) Serve(ctx context.Context) error {
@@ -55,6 +70,7 @@ func (s *Session) Serve(ctx context.Context) error {
 	defer func() {
 		_ = s.bufWriter.Flush()
 	}()
+	defer s.closeReadConn()
 
 	if err := s.handshake(); err != nil {
 		return err
@@ -62,6 +78,38 @@ func (s *Session) Serve(ctx context.Context) error {
 
 	return s.queryLoop(ctx)
 }
+
+// closeReadConn closes all per-session prepared statements and returns the connection to the pool.
+func (s *Session) closeReadConn() {
+	for _, stmt := range s.readStmts {
+		_ = stmt.Close()
+	}
+	s.readStmts = nil
+	if s.readConn != nil {
+		_ = s.readConn.Close()
+		s.readConn = nil
+	}
+}
+
+// getOrPrepareOnConn returns a prepared statement for query on the session's dedicated read connection.
+// Falls back to the pool-level prepared statement if the connection is unavailable.
+func (s *Session) getOrPrepareOnConn(ctx context.Context, query string) (*sql.Stmt, error) {
+	if s.readConn == nil {
+		return nil, fmt.Errorf("no dedicated read connection")
+	}
+	if stmt, ok := s.readStmts[query]; ok {
+		return stmt, nil
+	}
+	stmt, err := s.readConn.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.readStmts) < 64 {
+		s.readStmts[query] = stmt
+	}
+	return stmt, nil
+}
+
 
 func (s *Session) handshake() error {
 	for {
@@ -179,29 +227,37 @@ func (s *Session) handleSimpleQuery(ctx context.Context, sqlText string) {
 		s.backend.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus})
 
 	case QueryTypeRead:
-		s.executeReadQuery(ctx, sqlText, nil, true)
+		s.executeReadQuery(ctx, ConvertPlaceholders(sqlText), nil, true)
 
 	case QueryTypeWrite:
-		s.executeWriteQuery(ctx, sqlText, nil, true)
+		s.executeWriteQuery(ctx, ConvertPlaceholders(sqlText), nil, true)
 
 	default:
 		// Try as read query first, fallback to write
 		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sqlText)), "SELECT") {
-			s.executeReadQuery(ctx, sqlText, nil, true)
+			s.executeReadQuery(ctx, ConvertPlaceholders(sqlText), nil, true)
 		} else {
-			s.executeWriteQuery(ctx, sqlText, nil, true)
+			s.executeWriteQuery(ctx, ConvertPlaceholders(sqlText), nil, true)
 		}
 	}
 }
 
 func (s *Session) executeReadQuery(ctx context.Context, query string, args []any, sendReady bool) {
-	query = ConvertPlaceholders(query)
-	rows, err := s.store.Query(ctx, query, args...)
+	// Fast path: use dedicated per-session connection + per-connection stmt cache
+	// to avoid pool checkout and pool-level mutex on every read.
+	var rows *sql.Rows
+	var err error
+	if stmt, perConnErr := s.getOrPrepareOnConn(ctx, query); perConnErr == nil {
+		rows, err = stmt.QueryContext(ctx, args...)
+	} else {
+		rows, err = s.store.Query(ctx, query, args...)
+	}
 	if err != nil {
 		s.sendError(err.Error())
 		return
 	}
 	defer rows.Close()
+
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
@@ -215,28 +271,26 @@ func (s *Session) executeReadQuery(ctx context.Context, query string, args []any
 
 	// 2. Scan and stream DataRows
 	colCount := len(colTypes)
-	var rowCount int
+	// Pre-allocate scan buffers once — reused across all rows.
+	vals := make([]any, colCount)
+	scanDest := make([]any, colCount)
+	rowValues := make([][]byte, colCount)
+	dataRow := &pgproto3.DataRow{Values: rowValues}
+	for i := range vals {
+		scanDest[i] = &vals[i]
+	}
 
+	var rowCount int
 	for rows.Next() {
 		rowCount++
-		scanDest := make([]any, colCount)
-		for i := range scanDest {
-			var val any
-			scanDest[i] = &val
-		}
-
 		if err := rows.Scan(scanDest...); err != nil {
 			s.sendError(err.Error())
 			return
 		}
-
-		rowValues := make([][]byte, colCount)
-		for i, v := range scanDest {
-			actual := *(v.(*any))
-			rowValues[i] = FormatValue(actual)
+		for i, v := range vals {
+			rowValues[i] = FormatValue(v)
 		}
-
-		s.backend.Send(&pgproto3.DataRow{Values: rowValues})
+		s.backend.Send(dataRow)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -245,15 +299,13 @@ func (s *Session) executeReadQuery(ctx context.Context, query string, args []any
 	}
 
 	// 3. CommandComplete and optional ReadyForQuery
-	tag := fmt.Sprintf("SELECT %d", rowCount)
-	s.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	s.backend.Send(&pgproto3.CommandComplete{CommandTag: strconv.AppendInt([]byte("SELECT "), int64(rowCount), 10)})
 	if sendReady {
 		s.backend.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus})
 	}
 }
 
 func (s *Session) executeWriteQuery(ctx context.Context, query string, args []any, sendReady bool) {
-	query = ConvertPlaceholders(query)
 	res, err := s.store.Exec(ctx, query, args...)
 	if err != nil {
 		s.sendError(err.Error())
@@ -273,7 +325,9 @@ func (s *Session) executeWriteQuery(ctx context.Context, query string, args []an
 
 func (s *Session) handleParse(msg *pgproto3.Parse) {
 	s.statements[msg.Name] = preparedStmt{
-		Query: msg.Query,
+		Query:          msg.Query,
+		ConvertedQuery: ConvertPlaceholders(msg.Query),
+		QueryType:      Classify(msg.Query),
 	}
 	s.backend.Send(&pgproto3.ParseComplete{})
 }
@@ -296,8 +350,10 @@ func (s *Session) handleBind(msg *pgproto3.Bind) {
 	}
 
 	s.portals[msg.DestinationPortal] = boundPortal{
-		Query: stmt.Query,
-		Args:  args,
+		Query:          stmt.Query,
+		ConvertedQuery: stmt.ConvertedQuery,
+		QueryType:      stmt.QueryType,
+		Args:           args,
 	}
 	s.backend.Send(&pgproto3.BindComplete{})
 }
@@ -310,8 +366,7 @@ func (s *Session) handleDescribe(ctx context.Context, msg *pgproto3.Describe) {
 			s.sendError(fmt.Sprintf("statement %q not found", msg.Name))
 			return
 		}
-		converted := ConvertPlaceholders(stmt.Query)
-		paramCount := strings.Count(converted, "?")
+		paramCount := strings.Count(stmt.ConvertedQuery, "?")
 		paramOIDs := make([]uint32, paramCount)
 		s.backend.Send(&pgproto3.ParameterDescription{ParameterOIDs: paramOIDs})
 		s.backend.Send(&pgproto3.NoData{})
@@ -327,12 +382,10 @@ func (s *Session) handleExecute(ctx context.Context, msg *pgproto3.Execute) {
 		s.sendError(fmt.Sprintf("portal %q not found", msg.Portal))
 		return
 	}
-
-	qType := Classify(portal.Query)
-	if qType == QueryTypeRead {
-		s.executeReadQuery(ctx, portal.Query, portal.Args, false)
+	if portal.QueryType == QueryTypeRead {
+		s.executeReadQuery(ctx, portal.ConvertedQuery, portal.Args, false)
 	} else {
-		s.executeWriteQuery(ctx, portal.Query, portal.Args, false)
+		s.executeWriteQuery(ctx, portal.ConvertedQuery, portal.Args, false)
 	}
 }
 

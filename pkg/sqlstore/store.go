@@ -214,6 +214,14 @@ func (s *Store) QueryRow(ctx context.Context, query string, args ...any) *sql.Ro
 	return s.db.QueryRow(ctx, query, args...)
 }
 
+// AcquireReadConn checks out a dedicated *sql.Conn from the pool.
+// The caller must call conn.Close() to return it when done (e.g. on session teardown).
+// Using a persistent connection per session avoids per-query pool-mutex overhead under high concurrency.
+func (s *Store) AcquireReadConn(ctx context.Context) (*sql.Conn, error) {
+	return s.db.AcquireConn(ctx)
+}
+
+
 // Snapshot implements plexus.Store by creating a WAL checkpoint and serializing the SQLite file.
 func (s *Store) Snapshot() ([]byte, error) {
 	return s.db.Backup(context.Background())

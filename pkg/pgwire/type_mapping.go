@@ -3,6 +3,7 @@ package pgwire
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,18 +81,18 @@ func FormatValue(val any) []byte {
 	case string:
 		return []byte(v)
 	case int64:
-		return []byte(fmt.Sprintf("%d", v))
+		return strconv.AppendInt(nil, v, 10)
 	case int:
-		return []byte(fmt.Sprintf("%d", v))
+		return strconv.AppendInt(nil, int64(v), 10)
 	case float64:
-		return []byte(fmt.Sprintf("%g", v))
+		return strconv.AppendFloat(nil, v, 'g', -1, 64)
 	case bool:
 		if v {
 			return []byte("t")
 		}
 		return []byte("f")
 	case time.Time:
-		return []byte(v.Format("2006-01-02 15:04:05.999999-07"))
+		return v.AppendFormat(nil, "2006-01-02 15:04:05.999999-07")
 	default:
 		return []byte(fmt.Sprintf("%v", v))
 	}
