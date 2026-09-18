@@ -24,6 +24,8 @@ type backuper interface {
 type DB struct {
 	mu       sync.RWMutex
 	db       *sql.DB
+	stmtMu   sync.RWMutex
+	stmts    map[string]*sql.Stmt
 	filePath string
 	dsn      string
 	inMemory bool
@@ -41,7 +43,7 @@ func OpenDB(path string) (*DB, error) {
 	if path == "" || path == ":memory:" {
 		inMemory = true
 		memName := fmt.Sprintf("plexus_mem_%d_%d", os.Getpid(), atomic.AddUint64(&memCounter, 1))
-		dsn = fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=foreign_keys(ON)&_pragma=busy_timeout(10000)", memName)
+		dsn = fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=foreign_keys(ON)&_pragma=busy_timeout(10000)&_pragma=cache_size(-64000)&_pragma=temp_store(MEMORY)", memName)
 	} else if strings.HasPrefix(path, "file:") && strings.Contains(path, "mode=memory") {
 		inMemory = true
 		dsn = path
@@ -50,7 +52,7 @@ func OpenDB(path string) (*DB, error) {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("create db dir: %w", err)
 		}
-		dsn = fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", path)
+		dsn = fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=cache_size(-64000)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)", path)
 	}
 
 	sqlDB, err := sql.Open("sqlite", dsn)
@@ -59,9 +61,9 @@ func OpenDB(path string) (*DB, error) {
 	}
 
 	// Set connection pool limits:
-	// For shared in-memory SQLite, keeping idle connections alive prevents database disposal.
-	sqlDB.SetMaxOpenConns(10)
-	sqlDB.SetMaxIdleConns(5)
+	// Use larger pool to avoid lock contention under high client concurrency (c=32, c=64).
+	sqlDB.SetMaxOpenConns(64)
+	sqlDB.SetMaxIdleConns(32)
 
 	if err := sqlDB.Ping(); err != nil {
 		_ = sqlDB.Close()
@@ -70,6 +72,7 @@ func OpenDB(path string) (*DB, error) {
 
 	return &DB{
 		db:       sqlDB,
+		stmts:    make(map[string]*sql.Stmt),
 		filePath: path,
 		dsn:      dsn,
 		inMemory: inMemory,
@@ -93,22 +96,79 @@ func (d *DB) IsInMemory() bool {
 	return d.inMemory
 }
 
-// Query executes a query on the local database.
+func (d *DB) getOrPrepare(ctx context.Context, query string) (*sql.Stmt, error) {
+	d.stmtMu.RLock()
+	stmt, ok := d.stmts[query]
+	d.stmtMu.RUnlock()
+	if ok {
+		return stmt, nil
+	}
+
+	d.stmtMu.Lock()
+	defer d.stmtMu.Unlock()
+	if stmt, ok := d.stmts[query]; ok {
+		return stmt, nil
+	}
+
+	d.mu.RLock()
+	db := d.db
+	d.mu.RUnlock()
+	if db == nil {
+		return nil, fmt.Errorf("database closed")
+	}
+
+	// Cap statement cache at 256 queries to prevent unbounded memory growth
+	if len(d.stmts) >= 256 {
+		return db.PrepareContext(ctx, query)
+	}
+
+	prepared, err := db.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	d.stmts[query] = prepared
+	return prepared, nil
+}
+
+func (d *DB) closeStmtsLocked() {
+	d.stmtMu.Lock()
+	defer d.stmtMu.Unlock()
+	for _, stmt := range d.stmts {
+		if stmt != nil {
+			_ = stmt.Close()
+		}
+	}
+	d.stmts = make(map[string]*sql.Stmt)
+}
+
+// Query executes a query on the local database using cached prepared statements when available.
 func (d *DB) Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	stmt, err := d.getOrPrepare(ctx, query)
+	if err == nil {
+		return stmt.QueryContext(ctx, args...)
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.db.QueryContext(ctx, query, args...)
 }
 
-// QueryRow executes a query expected to return a single row.
+// QueryRow executes a query expected to return a single row using cached prepared statements when available.
 func (d *DB) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	stmt, err := d.getOrPrepare(ctx, query)
+	if err == nil {
+		return stmt.QueryRowContext(ctx, args...)
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.db.QueryRowContext(ctx, query, args...)
 }
 
-// Exec executes a mutation statement on the database.
+// Exec executes a mutation statement on the database using cached prepared statements when available.
 func (d *DB) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	stmt, err := d.getOrPrepare(ctx, query)
+	if err == nil {
+		return stmt.ExecContext(ctx, args...)
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.db.ExecContext(ctx, query, args...)
@@ -196,6 +256,9 @@ func (d *DB) Restore(ctx context.Context, data []byte) error {
 		return nil
 	}
 
+	// Close cached prepared statements before restoring
+	d.closeStmtsLocked()
+
 	// 1. Close existing connection pool
 	if err := d.db.Close(); err != nil {
 		return fmt.Errorf("close db during restore: %w", err)
@@ -215,8 +278,8 @@ func (d *DB) Restore(ctx context.Context, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("reopen restored sqlite db: %w", err)
 	}
-	newDB.SetMaxOpenConns(10)
-	newDB.SetMaxIdleConns(5)
+	newDB.SetMaxOpenConns(64)
+	newDB.SetMaxIdleConns(32)
 
 	if err := newDB.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping restored db: %w", err)
@@ -226,8 +289,9 @@ func (d *DB) Restore(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// Close closes the underlying database.
+// Close closes the underlying database and cached statements.
 func (d *DB) Close() error {
+	d.closeStmtsLocked()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.db != nil {

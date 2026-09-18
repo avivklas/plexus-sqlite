@@ -5,3 +5,4 @@
 *.seg
 data/
 *.tmp
+/bin/

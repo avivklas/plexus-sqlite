@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"github.com/avivklas/plexus-sqlite/pkg/sqlstore"
 	"github.com/jackc/pgproto3/v2"
 )
+
+const defaultBufferSize = 65536 // 64KB buffer for coalescing pgwire packets
 
 type preparedStmt struct {
 	Query string
@@ -24,6 +27,7 @@ type boundPortal struct {
 // Session handles an individual PostgreSQL client connection.
 type Session struct {
 	conn       net.Conn
+	bufWriter  *bufio.Writer
 	backend    *pgproto3.Backend
 	store      *sqlstore.Store
 	statements map[string]preparedStmt
@@ -33,9 +37,11 @@ type Session struct {
 
 // NewSession initializes a client session over a net.Conn.
 func NewSession(conn net.Conn, store *sqlstore.Store) *Session {
+	bufWriter := bufio.NewWriterSize(conn, defaultBufferSize)
 	return &Session{
 		conn:       conn,
-		backend:    pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn),
+		bufWriter:  bufWriter,
+		backend:    pgproto3.NewBackend(pgproto3.NewChunkReader(conn), bufWriter),
 		store:      store,
 		statements: make(map[string]preparedStmt),
 		portals:    make(map[string]boundPortal),
@@ -46,6 +52,9 @@ func NewSession(conn net.Conn, store *sqlstore.Store) *Session {
 // Serve runs the handshake and main command loop until client terminates or disconnects.
 func (s *Session) Serve(ctx context.Context) error {
 	defer s.conn.Close()
+	defer func() {
+		_ = s.bufWriter.Flush()
+	}()
 
 	if err := s.handshake(); err != nil {
 		return err
@@ -67,6 +76,9 @@ func (s *Session) handshake() error {
 			if _, err := s.conn.Write([]byte{'N'}); err != nil {
 				return fmt.Errorf("decline ssl: %w", err)
 			}
+			if err := s.bufWriter.Flush(); err != nil {
+				return fmt.Errorf("flush ssl decline: %w", err)
+			}
 			continue
 		case *pgproto3.StartupMessage:
 			// Complete authentication and parameters
@@ -77,7 +89,13 @@ func (s *Session) handshake() error {
 			s.backend.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
 			s.backend.Send(&pgproto3.ParameterStatus{Name: "integer_datetimes", Value: "on"})
 			s.backend.Send(&pgproto3.BackendKeyData{ProcessID: 1000, SecretKey: 12345})
-			return s.backend.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus})
+			if err := s.backend.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus}); err != nil {
+				return fmt.Errorf("send ready for query: %w", err)
+			}
+			if err := s.bufWriter.Flush(); err != nil {
+				return fmt.Errorf("flush startup messages: %w", err)
+			}
+			return nil
 		default:
 			return fmt.Errorf("unexpected startup msg: %T", startupMsg)
 		}
@@ -112,14 +130,25 @@ func (s *Session) queryLoop(ctx context.Context) error {
 		case *pgproto3.Execute:
 			s.handleExecute(ctx, v)
 		case *pgproto3.Sync:
-			s.backend.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus})
+			s.handleSync()
 		case *pgproto3.Terminate:
 			return nil
 		default:
 			// Unhandled message type, send error
 			s.sendError(fmt.Sprintf("unsupported message type: %T", msg))
 		}
+
+		if err := s.bufWriter.Flush(); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("flush: %w", err)
+		}
 	}
+}
+
+func (s *Session) handleSync() {
+	s.backend.Send(&pgproto3.ReadyForQuery{TxStatus: s.txStatus})
 }
 
 func (s *Session) handleSimpleQuery(ctx context.Context, sqlText string) {

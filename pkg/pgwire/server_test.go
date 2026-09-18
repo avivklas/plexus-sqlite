@@ -3,14 +3,17 @@ package pgwire
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/avivklas/plexus"
 	"github.com/avivklas/plexus-sqlite/pkg/sqlstore"
 	"github.com/hashicorp/raft"
+	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -117,5 +120,217 @@ func TestPGWireWithPostgresClient(t *testing.T) {
 	}
 	if name2 != "Alice" {
 		t.Errorf("expected Alice, got %s", name2)
+	}
+}
+
+type writeRecorderConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes [][]byte
+}
+
+func (c *writeRecorderConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	c.writes = append(c.writes, cp)
+	c.mu.Unlock()
+	return c.Conn.Write(b)
+}
+
+func (c *writeRecorderConn) getWriteCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.writes)
+}
+
+func (c *writeRecorderConn) resetWrites() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes = nil
+}
+
+func TestPGWireBufferedOutputCoalescing(t *testing.T) {
+	store, err := sqlstore.NewInMemory()
+	if err != nil {
+		t.Fatalf("NewInMemory failed: %v", err)
+	}
+	defer store.Close()
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	recorder := &writeRecorderConn{Conn: serverConn}
+	session := NewSession(recorder, store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- session.Serve(ctx)
+	}()
+
+	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(clientConn), clientConn)
+
+	// 1. Handshake
+	if err := frontend.Send(&pgproto3.StartupMessage{
+		ProtocolVersion: 196608,
+		Parameters:      map[string]string{"user": "postgres", "database": "testdb"},
+	}); err != nil {
+		t.Fatalf("send startup message: %v", err)
+	}
+
+	for {
+		msg, err := frontend.Receive()
+		if err != nil {
+			t.Fatalf("receive during handshake failed: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+
+	// Handshake messages (AuthenticationOk, 5 ParameterStatus, BackendKeyData, ReadyForQuery)
+	// should all be coalesced into 1 write!
+	handshakeWrites := recorder.getWriteCount()
+	if handshakeWrites != 1 {
+		t.Errorf("expected 1 coalesced write for handshake, got %d", handshakeWrites)
+	}
+
+	// 2. Simple Query: SELECT 1
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Query{String: "SELECT 1;"}); err != nil {
+		t.Fatalf("send query: %v", err)
+	}
+
+	for {
+		msg, err := frontend.Receive()
+		if err != nil {
+			t.Fatalf("receive during query failed: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+
+	// RowDescription + DataRow + CommandComplete + ReadyForQuery must coalesce into 1 TCP write!
+	queryWrites := recorder.getWriteCount()
+	if queryWrites != 1 {
+		t.Errorf("expected 1 coalesced write for simple query, got %d", queryWrites)
+	}
+
+	// 3. Error query: invalid SQL syntax or table
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Query{String: "SELECT * FROM nonexistent_table;"}); err != nil {
+		t.Fatalf("send invalid query: %v", err)
+	}
+
+	for {
+		msg, err := frontend.Receive()
+		if err != nil {
+			t.Fatalf("receive during error query failed: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+
+	// ErrorResponse + ReadyForQuery must coalesce into 1 TCP write!
+	errWrites := recorder.getWriteCount()
+	if errWrites != 1 {
+		t.Errorf("expected 1 coalesced write for error query, got %d", errWrites)
+	}
+
+	// 4. Extended Query Protocol: Parse -> Bind -> Describe -> Execute -> Sync
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Parse{Name: "stmt1", Query: "SELECT 1;"}); err != nil {
+		t.Fatalf("send parse: %v", err)
+	}
+	msg, err := frontend.Receive()
+	if err != nil {
+		t.Fatalf("receive parse response failed: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.ParseComplete); !ok {
+		t.Fatalf("expected ParseComplete, got %T", msg)
+	}
+	if parseWrites := recorder.getWriteCount(); parseWrites != 1 {
+		t.Errorf("expected 1 write for ParseComplete, got %d", parseWrites)
+	}
+
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Bind{DestinationPortal: "p1", PreparedStatement: "stmt1"}); err != nil {
+		t.Fatalf("send bind: %v", err)
+	}
+	msg, err = frontend.Receive()
+	if err != nil {
+		t.Fatalf("receive bind response failed: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.BindComplete); !ok {
+		t.Fatalf("expected BindComplete, got %T", msg)
+	}
+	if bindWrites := recorder.getWriteCount(); bindWrites != 1 {
+		t.Errorf("expected 1 write for BindComplete, got %d", bindWrites)
+	}
+
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Describe{ObjectType: 'P', Name: "p1"}); err != nil {
+		t.Fatalf("send describe: %v", err)
+	}
+	msg, err = frontend.Receive()
+	if err != nil {
+		t.Fatalf("receive describe response failed: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.NoData); !ok {
+		t.Fatalf("expected NoData, got %T", msg)
+	}
+	if descWrites := recorder.getWriteCount(); descWrites != 1 {
+		t.Errorf("expected 1 write for Describe, got %d", descWrites)
+	}
+
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Execute{Portal: "p1"}); err != nil {
+		t.Fatalf("send execute: %v", err)
+	}
+	for {
+		msg, err = frontend.Receive()
+		if err != nil {
+			t.Fatalf("receive execute response failed: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.CommandComplete); ok {
+			break
+		}
+	}
+	if execWrites := recorder.getWriteCount(); execWrites != 1 {
+		t.Errorf("expected 1 write for Execute, got %d", execWrites)
+	}
+
+	recorder.resetWrites()
+	if err := frontend.Send(&pgproto3.Sync{}); err != nil {
+		t.Fatalf("send sync: %v", err)
+	}
+	msg, err = frontend.Receive()
+	if err != nil {
+		t.Fatalf("receive sync response failed: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.ReadyForQuery); !ok {
+		t.Fatalf("expected ReadyForQuery, got %T", msg)
+	}
+	if syncWrites := recorder.getWriteCount(); syncWrites != 1 {
+		t.Errorf("expected 1 write for Sync, got %d", syncWrites)
+	}
+
+	// 5. Terminate
+	if err := frontend.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send terminate: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected Serve error upon terminate: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("session did not exit upon terminate")
 	}
 }
