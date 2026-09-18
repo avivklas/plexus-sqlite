@@ -4,9 +4,12 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -20,17 +23,35 @@ func main() {
 	var (
 		nodeID    = flag.String("node-id", "node-1", "Unique node identifier in cluster")
 		bindAddr  = flag.String("bind-addr", "127.0.0.1:9000", "Cluster Raft and RPC listen address")
+		advAddr   = flag.String("advertise-addr", "", "Address advertised to cluster peers for Raft and RPC (e.g. 172.31.x.x:9000)")
 		pgAddr    = flag.String("pg-addr", "127.0.0.1:5432", "PostgreSQL wire protocol listen address")
+		pprofAddr = flag.String("pprof-addr", "", "HTTP pprof profile address (e.g. 127.0.0.1:6060)")
 		dataDir   = flag.String("data-dir", "./data", "Directory for Raft consensus log store")
 		inMemory  = flag.Bool("in-memory", true, "Open SQLite database in memory (default: true)")
 		bootstrap = flag.Bool("bootstrap", false, "Bootstrap this node as the initial cluster leader")
 		joinAddrs = flag.String("join", "", "Comma-separated list of peer RPC addresses to join")
+		syncLog      = flag.Bool("sync-log", false, "Synchronously fsync Raft log appends to disk (default: false)")
+		followerWait = flag.Bool("follower-wait", true, "Wait for follower local FSM apply on writes before returning ACK (default: true)")
 	)
 	flag.Parse()
+
+	if *pprofAddr != "" {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+		go func() {
+			log.Printf("Starting pprof HTTP server on %s", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("pprof server error: %v", err)
+			}
+		}()
+	}
 
 	log.Printf("Starting Distributed SQLite Server (Plexus-SQLite)...")
 	log.Printf("Node ID: %s", *nodeID)
 	log.Printf("Cluster Addr: %s", *bindAddr)
+	if *advAddr != "" {
+		log.Printf("Advertise Addr: %s", *advAddr)
+	}
 	log.Printf("Postgres Protocol Addr: %s", *pgAddr)
 	log.Printf("Consensus Data Dir: %s", *dataDir)
 
@@ -59,6 +80,11 @@ func main() {
 	clusterCfg := plexus.DefaultClusterConfig(*nodeID, *bindAddr, *dataDir)
 	clusterCfg.Bootstrap = *bootstrap
 	clusterCfg.ApplyTimeout = 10 * time.Second
+	clusterCfg.SyncLog = *syncLog
+	clusterCfg.FollowerWaitLocalApply = *followerWait
+	if *advAddr != "" {
+		clusterCfg.AdvertiseAddr = *advAddr
+	}
 
 	if *joinAddrs != "" {
 		for _, addr := range strings.Split(*joinAddrs, ",") {

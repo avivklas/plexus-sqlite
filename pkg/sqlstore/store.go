@@ -145,6 +145,25 @@ func (s *Store) Exec(ctx context.Context, query string, args ...any) (*ExecRespo
 	if respPtr, ok := res.(*ExecResponse); ok {
 		return respPtr, nil
 	}
+	if m, ok := res.(map[string]any); ok {
+		resp := ExecResponse{}
+		if v, exists := m["rows_affected"]; exists {
+			if num, ok := v.(float64); ok {
+				resp.RowsAffected = int64(num)
+			}
+		}
+		if v, exists := m["last_insert_id"]; exists {
+			if num, ok := v.(float64); ok {
+				resp.LastInsertID = int64(num)
+			}
+		}
+		if v, exists := m["tag"]; exists {
+			if tagStr, ok := v.(string); ok {
+				resp.Tag = tagStr
+			}
+		}
+		return &resp, nil
+	}
 
 	return nil, fmt.Errorf("unexpected exec response type: %T", res)
 }
@@ -169,6 +188,15 @@ func (s *Store) Batch(ctx context.Context, stmts []string) (*BatchResponse, erro
 	}
 	if respPtr, ok := res.(*BatchResponse); ok {
 		return respPtr, nil
+	}
+	if m, ok := res.(map[string]any); ok {
+		resp := BatchResponse{}
+		if v, exists := m["total_rows_affected"]; exists {
+			if num, ok := v.(float64); ok {
+				resp.TotalRowsAffected = int64(num)
+			}
+		}
+		return &resp, nil
 	}
 
 	return nil, fmt.Errorf("unexpected batch response type: %T", res)
